@@ -1,0 +1,16 @@
+[package]
+name = "download"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+futures = "0.3"
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.18.3"
+governor = "0.10.2"
+csv = "1.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+url = { version = "2", features = ["serde"] }

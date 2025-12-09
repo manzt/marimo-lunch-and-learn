@@ -1,0 +1,7 @@
+__marimo__/
+target/
+*.jpg
+*.csv
+.venv
+*.npz
+.ipynb_checkpoints
