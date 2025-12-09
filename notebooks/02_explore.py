@@ -1,7 +1,7 @@
 import marimo
 
-__generated_with = "0.18.4"
-app = marimo.App(width="medium")
+__generated_with = "0.23.1"
+app = marimo.App()
 
 
 @app.cell(hide_code=True)
@@ -26,11 +26,10 @@ def _(mo):
 @app.cell
 def _(load_data):
     df = load_data()
-    df
     return (df,)
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _():
     import polars as pl
     import marimo as mo
@@ -38,62 +37,90 @@ def _():
 
 
     @mo.persistent_cache
-    def load_data() -> pl.DataFrame:
-        # curated set of images in public domain
-        public_domain_ids = [
-            int(id)
-            for id in (pathlib.Path(__file__).parent / "public_domain_ids.txt")
-            .read_text(encoding="utf8")
-            .split("\n")
-        ]
-
-        # rest of the public database dump
-        url = "https://github.com/NationalGalleryOfArt/opendata/raw/refs/heads/main/data/"
-
-        tsne = pl.read_parquet(pathlib.Path(__file__).parent / "tsne.parquet")
-
-        objects = pl.read_csv(url + "objects.csv", ignore_errors=True).select(
-            pl.col("objectid"),
-            pl.col("title"),
-            pl.col("beginyear").alias("year"),
-            pl.col("medium"),
-            pl.col("visualbrowserclassification").alias("type"),
-        )
-
+    def load_data(
+        base="https://raw.githubusercontent.com/NationalGalleryOfArt/opendata/main/data",
+    ) -> pl.DataFrame:
+        objects = pl.read_csv(f"{base}/objects.csv", infer_schema_length=10000)
         constituents = pl.read_csv(
-            url + "constituents.csv", ignore_errors=True
-        ).select(
-            pl.col("constituentid"),
-            pl.col("forwarddisplayname").alias("name"),
-            pl.col("visualbrowsernationality").alias("nationality"),
+            f"{base}/constituents.csv", infer_schema_length=10000
         )
-
-        published_images = pl.read_csv(url + "published_images.csv").select(
-            pl.col("depictstmsobjectid").alias("objectid"),
-            pl.col("uuid"),
-            pl.col("iiifthumburl").alias("thumburl"),
+        obj_constituents = pl.read_csv(
+            f"{base}/objects_constituents.csv",
+            infer_schema_length=10000,
+            schema_overrides={"zipcode": pl.Utf8},
         )
-
-        objects_constituents = (
-            pl.read_csv(url + "objects_constituents.csv", ignore_errors=True)
-            .filter(pl.col("role").eq(pl.lit("artist")))
-            .sort(by="displayorder")
+        images = pl.read_csv(
+            f"{base}/published_images.csv", infer_schema_length=10000
+        )
+        artists = (
+            obj_constituents.filter(pl.col("roletype") == "artist")
+            .sort("displayorder")
             .group_by("objectid")
             .first()
-            .select("objectid", "constituentid")
+            .join(
+                constituents.select(
+                    "constituentid",
+                    pl.col("preferreddisplayname").alias("artist"),
+                    pl.col("nationality").alias("artist_nationality"),
+                ),
+                on="constituentid",
+            )
+            .select("objectid", "artist", "artist_nationality")
         )
 
-        return (
-            objects.join(objects_constituents, on="objectid")
-            .join(constituents, on="constituentid")
-            .join(published_images, on="objectid")
-            .join(tsne, on="objectid")
-            .select(pl.col("thumburl"), pl.exclude("constituentid", "thumburl"))
-            .with_columns(
-                pl.col("objectid").is_in(public_domain_ids).alias("public")
+        thumbnails = (
+            images.filter(
+                (pl.col("viewtype") == "primary") & (pl.col("sequence") == 0)
             )
-            .sort(by="year", descending=True, nulls_last=True)
+            .group_by("depictstmsobjectid")
+            .first()
+            .select(
+                pl.col("depictstmsobjectid").alias("objectid"),
+                pl.col("iiifthumburl").alias("thumbnail"),
+                pl.col("iiifurl").alias("iiif_url"),
+                "width",
+                "height",
+                pl.col("openaccess").alias("public_domain"),
+            )
         )
+        tsne = pl.read_parquet(pathlib.Path(__file__).parent / "tsne.parquet")
+
+        return (
+            objects.select(
+                "objectid",
+                "title",
+                pl.col("displaydate").alias("date"),
+                "beginyear",
+                "medium",
+                "classification",
+            )
+            .join(artists, on="objectid", how="left")
+            .join(thumbnails, on="objectid", how="left")
+            .join(tsne, on="objectid", how="left")
+            .filter(
+                pl.col("thumbnail").is_not_null(),
+                pl.col("x").is_not_null(),
+                pl.col("y").is_not_null(),
+            )
+            .with_columns(pl.col("public_domain").cast(pl.Boolean))
+            .select(
+                "thumbnail",
+                "iiif_url",
+                "title",
+                "artist",
+                "artist_nationality",
+                "date",
+                "beginyear",
+                "medium",
+                pl.col("classification").alias("type"),
+                "width",
+                "height",
+                pl.col("public_domain").alias("public"),
+                "x",
+                "y",
+            )
+        )
+
     return load_data, mo, pl
 
 
@@ -147,13 +174,13 @@ def _(df):
 @app.cell
 def _(alt, subset):
     alt.Chart(
-        subset.group_by("name", "public")
+        subset.group_by("artist", "public")
         .len()
         .sort("len", descending=True)
         .head(15)
     ).mark_bar().encode(
         x=alt.X("len", title="Count"),
-        y=alt.Y("name", title="Artist", sort="-x"),
+        y=alt.Y("artist", title="Artist", sort="-x"),
         color=alt.Color("public", title="Public domain"),
     )
     return
@@ -187,198 +214,198 @@ def _(mo):
 
 
 @app.cell
-def _(GalleryWidget, subset):
-    GalleryWidget(subset.sample(500, seed=42))
+def _(GalleryWidget, pl, subset):
+    GalleryWidget(
+        data=subset.filter(pl.col("public")).sample(500, seed=42), page_size=15
+    )
     return
 
 
-@app.cell
-def _(GALLERY_WIDGET_ESM, GALLERY_WIDGET_STYLES, pl):
+@app.cell(hide_code=True)
+def _(pl):
     import anywidget
     import traitlets
 
+
     class GalleryWidget(anywidget.AnyWidget):
-        _esm = GALLERY_WIDGET_ESM
-        _css = GALLERY_WIDGET_STYLES
+        """Paginated mosaic gallery with multi-select and right-click detail."""
 
-        _ipc = traitlets.Any().tag(sync=True)
-        size = traitlets.Int(100).tag(sync=True)
-        page = traitlets.Int(0).tag(sync=True)
-        page_size = traitlets.Int(12).tag(sync=True)
+        _data = traitlets.Any(b"").tag(sync=True)
+        selected = traitlets.List([]).tag(sync=True)
+        page_size = traitlets.Int(60).tag(sync=True)
 
-        def __init__(
-            self, objects: pl.DataFrame, *, size: int = 90, page_size: int = 20
-        ) -> None:
-            super().__init__(
-                _ipc=objects.write_ipc(None).getvalue(),
-                size=size,
-                page=0,
-                page_size=page_size,
-            )
-    return (GalleryWidget,)
+        def __init__(self, data: pl.DataFrame, **kwargs):
+            buf = data.write_ipc(None)
+            assert buf is not None
+            kwargs["_data"] = buf.getvalue()
+            super().__init__(**kwargs)
 
-
-@app.cell(hide_code=True)
-def _():
-    GALLERY_WIDGET_ESM = """
-    import * as flech from "https://esm.sh/@uwdata/flechette@2.0.0";
-
+        _esm = """
+    import { tableFromIPC } from "https://esm.sh/@uwdata/flechette@2";
     function render({ model, el }) {
-      let objects = flech.tableFromIPC(new Uint8Array(model.get("_ipc").buffer));
-
-      let container = document.createElement("div");
-      container.className = "gallery";
-
-      let paginationControls = document.createElement("div");
-      paginationControls.className = "pagination-controls";
-
-      let prevButton = document.createElement("button");
-      prevButton.innerText = "← Previous";
-
-      let pageIndicator = document.createElement("span");
-      pageIndicator.className = "page-indicator";
-      let nextButton = document.createElement("button");
-      nextButton.innerText = "Next →";
-
-      paginationControls.appendChild(prevButton);
-      paginationControls.appendChild(pageIndicator);
-      paginationControls.appendChild(nextButton);
-
-      el.appendChild(container);
-      el.appendChild(paginationControls);
-
-      function update() {
-        container.replaceChildren();
-
-        let size = model.get("size");
-        let page = model.get("page");
-        let pageSize = model.get("page_size");
-        let totalPages = Math.ceil(objects.numRows / pageSize);
-
-        container.style.gridTemplateColumns = `repeat(auto-fill, minmax(${size}px, 1fr))`;
-
-        let startIdx = page * pageSize;
-        let endIdx = Math.min(startIdx + pageSize, objects.numRows);
-
-        for (let i = startIdx; i < endIdx; i++) {
-          let row = objects.get(i);
-          let item = document.createElement("div");
-          item.className = "gallery-item";
-
-          let link = Object.assign(document.createElement("a"), {
-            className: "thumb-link",
-            href: `https://www.nga.gov/collection/art-object-page.${row.objectid}.html`,
-            target: "_blank",
-            rel: "noopener noreferrer",
-          });
-          link.style.width = `${size}px`;
-          link.style.height = `${size}px`;
-
-          let img = Object.assign(document.createElement("img"), {
-            src: row.thumburl,
-            alt: row.title,
-          });
-          link.appendChild(img);
-
-          if (row.public) {
-            let badge = Object.assign(document.createElement("img"), {
-              src: "https://mirrors.creativecommons.org/presskit/icons/zero.svg",
-              alt: "Public Domain",
-              className: "public-domain-badge",
-            });
-            link.appendChild(badge);
-          }
-
-          item.appendChild(link);
-          container.appendChild(item);
+      const controller = new AbortController();
+      const { signal } = controller;
+      let currentPage = 0;
+      let table = null;
+      function parseTable() {
+        const buf = model.get("_data");
+        if (buf && buf.byteLength) {
+          table = tableFromIPC(new Uint8Array(buf.buffer));
         }
-
-        pageIndicator.innerText = `Page ${page + 1} of ${totalPages}`;
-        prevButton.disabled = page <= 0;
-        nextButton.disabled = page >= totalPages - 1;
       }
-
-      update();
-
-      prevButton.addEventListener("click", () => {
-        let page = model.get("page");
-        if (page > 0) {
-          model.set("page", page - 1);
-          model.save_changes();
+      const style = document.createElement("style");
+      style.textContent = `
+        .gallery-root { font-family: system-ui, sans-serif; }
+        .gallery-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+          gap: 6px;
+          padding: 4px;
+          grid-auto-rows: 8px;
         }
-      });
-
-      nextButton.addEventListener("click", () => {
-        let page = model.get("page");
-        let pageSize = model.get("page_size");
-        let totalPages = Math.ceil(objects.numRows / pageSize);
-
-        if (page < totalPages - 1) {
-          model.set("page", page + 1);
-          model.save_changes();
+        @supports (display: grid-lanes) {
+          .gallery-grid {
+            display: grid-lanes;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 6px;
+            padding: 4px;
+          }
         }
-      });
-
-      model.on("change:page", update);
-      model.on("change:size", update);
-      model.on("change:page_size", update);
+        .gallery-card {
+          position: relative; cursor: pointer; border-radius: 6px;
+          overflow: hidden; background: #f0f0f0;
+          border: 3px solid transparent; transition: border-color 0.15s;
+        }
+        .gallery-card.selected { border-color: #3b82f6; }
+        .gallery-card img { width: 100%; display: block; }
+        .gallery-overlay {
+          position: absolute; bottom: 0; left: 0; right: 0;
+          background: linear-gradient(transparent, rgba(0,0,0,.75));
+          color: white; padding: 20px 6px 6px; font-size: 11px;
+          opacity: 0; transition: opacity 0.15s; pointer-events: none;
+        }
+        .gallery-card:hover .gallery-overlay { opacity: 1; }
+        .gallery-nav {
+          display: flex; align-items: center; justify-content: center;
+          gap: 8px; padding: 8px 0; user-select: none;
+        }
+        .gallery-nav button {
+          padding: 4px 14px; border: 1px solid #ccc; border-radius: 6px;
+          background: white; color: #333; cursor: pointer; font-size: 13px;
+        }
+        .gallery-nav button:disabled { opacity: 0.4; cursor: default; }
+        .gallery-nav span { font-size: 13px; color: #555; min-width: 120px; text-align: center; }
+        dialog.gallery-popup {
+          border: 1px solid #ccc; border-radius: 12px; padding: 0;
+          max-width: 480px; width: 90vw; box-shadow: 0 8px 32px rgba(0,0,0,.25);
+          overflow: hidden;
+        }
+        dialog.gallery-popup::backdrop { background: rgba(0,0,0,.4); }
+      `;
+      el.appendChild(style);
+      const root = document.createElement("div");
+      root.className = "gallery-root";
+      const nav = document.createElement("div");
+      nav.className = "gallery-nav";
+      const prevBtn = document.createElement("button");
+      prevBtn.textContent = "\u2190 Prev";
+      const pageInfo = document.createElement("span");
+      const nextBtn = document.createElement("button");
+      nextBtn.textContent = "Next \u2192";
+      nav.append(prevBtn, pageInfo, nextBtn);
+      const grid = document.createElement("div");
+      grid.className = "gallery-grid";
+      const popup = document.createElement("dialog");
+      popup.className = "gallery-popup";
+      popup.addEventListener("click", (e) => { if (e.target === popup) popup.close(); }, { signal });
+      root.append(nav, grid, popup);
+      el.appendChild(root);
+      function val(name, i) { return table.getChild(name).at(i); }
+      function totalPages() {
+        if (!table) return 1;
+        return Math.max(1, Math.ceil(table.numRows / model.get("page_size")));
+      }
+      function buildGrid() {
+        grid.innerHTML = "";
+        if (!table) { pageInfo.textContent = "No data"; return; }
+        const ps = model.get("page_size");
+        const selected = new Set(model.get("selected"));
+        const start = currentPage * ps;
+        const end = Math.min(start + ps, table.numRows);
+        prevBtn.disabled = currentPage === 0;
+        nextBtn.disabled = currentPage >= totalPages() - 1;
+        pageInfo.textContent = `Page ${currentPage + 1} of ${totalPages()} (${table.numRows.toLocaleString()} total)`;
+        const ROW_H = 8;
+        const GAP = 6;
+        for (let globalIdx = start; globalIdx < end; globalIdx++) {
+          const w = val("width", globalIdx) || 1;
+          const h = val("height", globalIdx) || 1;
+          const ratio = h / w;
+          const card = document.createElement("div");
+          card.className = "gallery-card" + (selected.has(globalIdx) ? " selected" : "");
+          const estHeight = 120 * ratio;
+          const span = Math.max(2, Math.ceil((estHeight + GAP) / (ROW_H + GAP)));
+          card.style.gridRowEnd = `span ${span}`;
+          const img = document.createElement("img");
+          img.src = val("thumbnail", globalIdx);
+          img.alt = val("title", globalIdx) ?? "";
+          img.loading = "lazy";
+          card.appendChild(img);
+          const overlay = document.createElement("div");
+          overlay.className = "gallery-overlay";
+          overlay.textContent = val("title", globalIdx) ?? "";
+          card.appendChild(overlay);
+          card.addEventListener("click", (e) => {
+            if (e.metaKey || e.ctrlKey) {
+              const iiif = val("iiif_url", globalIdx);
+              window.open(iiif + "/full/full/0/default.jpg", "_blank");
+              return;
+            }
+            const sel = new Set(model.get("selected"));
+            if (e.shiftKey) {
+              sel.has(globalIdx) ? sel.delete(globalIdx) : sel.add(globalIdx);
+            } else {
+              if (sel.size === 1 && sel.has(globalIdx)) sel.clear();
+              else { sel.clear(); sel.add(globalIdx); }
+            }
+            model.set("selected", [...sel].sort((a, b) => a - b));
+            model.save_changes();
+          }, { signal });
+          card.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            const iiif = val("iiif_url", globalIdx);
+            popup.innerHTML = `
+              <img src="${iiif}/full/!800,800/0/default.jpg"
+                   style="width:100%;display:block;background:#000;" />
+              <div style="padding:16px;">
+                <h3 style="margin:0 0 4px;">${val("title", globalIdx) ?? ""}</h3>
+                <p style="margin:0 0 2px;color:#555;">${val("artist", globalIdx) ?? "Unknown artist"}</p>
+                <p style="margin:0 0 2px;color:#777;font-size:13px;">${val("date", globalIdx) ?? ""}</p>
+                <p style="margin:0 0 2px;color:#777;font-size:13px;">${val("medium", globalIdx) ?? ""}</p>
+                <p style="margin:0;color:#777;font-size:13px;">${val("type", globalIdx) ?? ""}</p>
+              </div>
+            `;
+            popup.showModal();
+          }, { signal });
+          grid.appendChild(card);
+        }
+      }
+      prevBtn.addEventListener("click", () => {
+        if (currentPage > 0) { currentPage--; buildGrid(); grid.scrollTop = 0; }
+      }, { signal });
+      nextBtn.addEventListener("click", () => {
+        if (currentPage < totalPages() - 1) { currentPage++; buildGrid(); grid.scrollTop = 0; }
+      }, { signal });
+      model.on("change:_data", () => { parseTable(); currentPage = 0; buildGrid(); });
+      model.on("change:selected", buildGrid);
+      parseTable();
+      buildGrid();
+      return () => controller.abort();
     }
-
     export default { render };
     """
 
-    GALLERY_WIDGET_STYLES = """
-    .gallery {
-      display: grid;
-      gap: 8px;
-      margin-bottom: 15px;
-    }
-    .gallery-item {
-      position: relative;
-      text-align: center;
-    }
-    .thumb-link {
-      display: block;
-      position: relative;
-    }
-    .thumb-link img:first-child {
-      width: 100%;
-      height: 100%;
-      object-fit: cover;
-      border-radius: 5px;
-    }
-    .public-domain-badge {
-      position: absolute;
-      bottom: 3px;
-      right: 3px;
-      width: 20px;
-      height: 20px;
-      opacity: 0.6;
-    }
-    .pagination-controls {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      margin-top: 10px;
-      gap: 15px;
-    }
-    .pagination-controls button {
-      padding: 5px 10px;
-      background-color: var(--background);
-      border: 1px solid #ccc;
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    .pagination-controls button:disabled {
-      background-color: var(--background);
-      color: #999;
-      cursor: not-allowed;
-    }
-    .page-indicator {
-      font-size: 14px;
-    }
-    """
-    return GALLERY_WIDGET_ESM, GALLERY_WIDGET_STYLES
+    return (GalleryWidget,)
 
 
 @app.cell(hide_code=True)
@@ -400,16 +427,27 @@ def _(df, mo):
     scatter.height(500)
     scatter.color(by="type")
     scatter.legend(True)
-    scatter.tooltip(True, preview="thumburl", preview_type="image")
+    scatter.tooltip(True, preview="thumbnail", preview_type="image")
 
-    w = mo.ui.anywidget(scatter.widget)
-    w
-    return pdf, w
+    get_selection, set_selection = mo.state(scatter.widget.selection)
+    scatter.widget.observe(
+        lambda _: set_selection(scatter.widget.selection), names=["selection"]
+    )
+    scatter.widget
+    return get_selection, pdf
 
 
 @app.cell
-def _(GalleryWidget, pdf, pl, w):
-    GalleryWidget(pl.from_pandas(pdf.iloc[w.selection]))
+def _(GalleryWidget, get_selection, pdf, pl):
+    GalleryWidget(
+        data=pl.from_pandas(pdf.iloc[get_selection()]),
+        page_size=20,
+    )
+    return
+
+
+@app.cell
+def _():
     return
 
 
